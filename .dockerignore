@@ -1,0 +1,9 @@
+.venv/
+.env
+__pycache__/
+*.pyc
+.git/
+TenVision/.git/
+TenVision/images/
+TenVision/.venv/
+rainyun_signin_analysis.md
