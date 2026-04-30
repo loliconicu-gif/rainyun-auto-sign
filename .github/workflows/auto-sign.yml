@@ -1,0 +1,35 @@
+name: 雨云每日自动签到
+
+on:
+  schedule:
+    # 每天北京时间 09:00 运行（UTC+8，即 UTC 01:00）
+    - cron: '0 1 * * *'
+  workflow_dispatch:  # 允许手动触发
+
+jobs:
+  sign-in:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 uv
+        uses: astral-sh/setup-uv@v4
+
+      - name: 设置 Python 版本
+        run: uv python install
+
+      - name: 安装依赖
+        run: uv sync
+
+      - name: 创建账号配置文件
+        run: |
+          mkdir -p accounts
+          cat > accounts/account.env << EOF
+          username: ${{ secrets.RAINYUN_USERNAME }}
+          password: ${{ secrets.RAINYUN_PASSWORD }}
+          EOF
+
+      - name: 执行签到
+        run: uv run python rainyun_signin.py --env accounts/account.env
