@@ -1,9 +1,7 @@
 services:
   rainyun-signin:
     build: .
-    container_name: rainyun-signin
-    restart: unless-stopped
     volumes:
-      - ./.env:/app/.env:ro
+      - ./accounts:/app/accounts:ro
     environment:
       - TZ=Asia/Shanghai

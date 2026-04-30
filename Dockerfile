@@ -1,11 +1,10 @@
 FROM python:3.12-slim
 
-ENV DEBIAN_FRONTEND=noninteractive
+ENV PYTHONUNBUFFERED=1
 ENV TZ=Asia/Shanghai
 
 # 系统依赖（Playwright chromium 需要）
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    cron \
     tzdata \
     wget \
     fonts-noto-cjk \
@@ -46,14 +45,7 @@ RUN uv sync --frozen --no-dev \
 COPY rainyun_signin.py ./
 COPY TenVision/ ./TenVision/
 
-# cron 配置：每天 9:00 执行
-RUN echo '0 9 * * * cd /app && /app/.venv/bin/python rainyun_signin.py >> /var/log/rainyun.log 2>&1' > /etc/cron.d/rainyun \
-    && chmod 0644 /etc/cron.d/rainyun \
-    && crontab /etc/cron.d/rainyun
+VOLUME ["/app/accounts"]
 
-COPY entrypoint.sh /entrypoint.sh
-RUN chmod +x /entrypoint.sh
-
-VOLUME ["/app/.env"]
-
-ENTRYPOINT ["/entrypoint.sh"]
+ENTRYPOINT ["/app/.venv/bin/python", "/app/rainyun_signin.py"]
+CMD ["--env-dir", "/app/accounts"]

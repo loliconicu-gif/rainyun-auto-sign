@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import argparse
 import ast
-import base64
 import hashlib
 import json
 import re
@@ -16,19 +15,29 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from playwright.sync_api import BrowserContext, Frame, Page, Response, TimeoutError as PlaywrightTimeoutError, sync_playwright
+from playwright.sync_api import BrowserContext, Frame, Page, TimeoutError as PlaywrightTimeoutError, sync_playwright
 
 REWARD_URL = "https://app.rainyun.com/account/reward/earn"
 REWARD_URL_HASH = "https://app.rainyun.com/account/reward/earn#"
 DASHBOARD_URL = "https://app.rainyun.com/dashboard"
 LOGIN_API = "https://api.v2.rainyun.com/user/login"
+USER_CSRF_API = "https://api.v2.rainyun.com/user/csrf"
 TASKS_API = "https://api.v2.rainyun.com/user/reward/tasks"
 VERIFY_API = "https://turing.captcha.qcloud.com/cap_union_new_verify"
 QCAPTCHA_ORIGIN = "https://turing.captcha.qcloud.com"
 GTIMG_ORIGIN = "https://turing.captcha.gtimg.com"
-DEFAULT_TIMEOUT_MS = 30_000
+DEFAULT_TIMEOUT_MS = 60_000
+TCAPTCHA_APP_ID = "2039519451"
+TCAPTCHA_JS = "https://turing.captcha.qcloud.com/TCaptcha.js"
+CAPTCHA_VERIFY_MAX_ATTEMPTS = 5
 BASE_DIR = Path(__file__).resolve().parent
 TENVISION_MAIN = BASE_DIR / "TenVision" / "main.py"
+
+
+def log_stage(stage: str, **details: Any) -> None:
+    payload = {"stage": stage, **details}
+    print(json.dumps(payload, ensure_ascii=False), file=sys.stderr, flush=True)
+
 
 SOLVER_JS = r"""
 (() => {
@@ -371,25 +380,6 @@ def install_solver(frame: Frame) -> None:
     frame.evaluate(SOLVER_JS)
 
 
-def build_data_url(path: Path) -> str:
-    mime = "image/jpeg"
-    if path.suffix.lower() == ".png":
-        mime = "image/png"
-    encoded = base64.b64encode(path.read_bytes()).decode()
-    return f"data:{mime};base64,{encoded}"
-
-
-def solve_points(frame: Frame, inst_url: str, bg_url: str) -> dict[str, Any]:
-    install_solver(frame)
-    result = frame.evaluate(
-        "({instUrl, bgUrl}) => window.__rainyunSolver.solveByUrls(instUrl, bgUrl)",
-        {"instUrl": inst_url, "bgUrl": bg_url},
-    )
-    if not result or len(result.get("points", [])) != 3:
-        raise SignInError("验证码识别结果异常")
-    return result
-
-
 def wait_for_captcha_assets(frame: Frame) -> None:
     frame.wait_for_function(
         """
@@ -486,41 +476,146 @@ def solve_points_with_tenvision(frame: Frame, bg_size: list[int]) -> dict[str, A
     }
 
 
+def goto_app_page(page: Page, url: str, timeout_ms: int = DEFAULT_TIMEOUT_MS) -> None:
+    log_stage("goto:start", url=url)
+    try:
+        page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+        log_stage("goto:done", url=page.url)
+    except PlaywrightTimeoutError:
+        if page.url.startswith(url):
+            log_stage("goto:timeout-but-arrived", url=page.url)
+            return
+        log_stage("goto:timeout", requested_url=url, current_url=page.url)
+        raise
+
+
 def login_via_protocol(page: Page, creds: Credentials) -> None:
-    page.goto(REWARD_URL, wait_until="load", timeout=DEFAULT_TIMEOUT_MS)
-    page.evaluate(
+    log_stage("login:start", username=creds.username)
+    goto_app_page(page, REWARD_URL)
+    rys = build_rys_header(page)
+    login_result = page.evaluate(
         """
-        async ({field, password, loginApi}) => {
+        async ({field, password, loginApi, rys}) => {
           const resp = await fetch(loginApi, {
             method: 'POST',
             credentials: 'include',
             headers: {
+              'accept': 'application/json, text/plain, */*',
               'content-type': 'application/json',
               'origin': 'https://app.rainyun.com',
-              'referer': 'https://app.rainyun.com/'
+              'referer': 'https://app.rainyun.com/',
+              'x-csrf-token': 'undefined',
+              'rys': rys,
             },
             body: JSON.stringify({field, password})
           });
           return await resp.json();
         }
         """,
-        {"field": creds.username, "password": creds.password, "loginApi": LOGIN_API},
+        {"field": creds.username, "password": creds.password, "loginApi": LOGIN_API, "rys": rys},
     )
-    page.goto(DASHBOARD_URL, wait_until="load", timeout=DEFAULT_TIMEOUT_MS)
-    page.wait_for_timeout(3000)
-    page.goto(REWARD_URL_HASH, wait_until="load", timeout=DEFAULT_TIMEOUT_MS)
-    page.wait_for_timeout(5000)
+    log_stage("login:api-result", username=creds.username, code=login_result.get("code"), msg=login_result.get("msg"))
+
+    rain_session = ""
+    for _ in range(25):
+        rain_session = get_cookie_value(page, LOGIN_API, "rain-session")
+        if rain_session:
+            break
+        page.wait_for_timeout(200)
+    if not rain_session:
+        raise SignInError("登录成功后未拿到 rain-session")
+    log_stage("login:session-ready", username=creds.username)
+
+    csrf_value = ""
+    csrf_resp: Any = None
+    for attempt in range(1, 6):
+        csrf_resp = auth_fetch(page, USER_CSRF_API, "GET")
+        candidate = csrf_resp.get("data") if isinstance(csrf_resp, dict) else csrf_resp
+        if isinstance(candidate, str) and candidate:
+            csrf_value = candidate
+            break
+        log_stage("login:csrf:retry", username=creds.username, attempt=attempt, response=csrf_resp)
+        page.wait_for_timeout(300)
+    if not csrf_value:
+        raise SignInError(f"刷新 CSRF 失败: {csrf_resp}")
+
+    page.context.add_cookies(
+        [
+            {
+                "name": "X-CSRF-Token",
+                "value": urllib.parse.quote(csrf_value, safe=""),
+                "domain": ".rainyun.com",
+                "path": "/",
+                "httpOnly": False,
+                "secure": True,
+                "sameSite": "None",
+            }
+        ]
+    )
+
+    csrf_ready = ""
+    for _ in range(10):
+        csrf_ready = get_cookie_value(page, LOGIN_API, "X-CSRF-Token")
+        if csrf_ready:
+            break
+        page.wait_for_timeout(200)
+
+    log_stage(
+        "login:cookies",
+        username=creds.username,
+        cookie_names=list_context_cookie_names(page),
+        csrf_present=bool(csrf_ready),
+        session_present=bool(rain_session),
+    )
+    if not csrf_ready:
+        raise SignInError("刷新 CSRF 后未成功写入 CookieJar")
+    goto_app_page(page, DASHBOARD_URL)
+    page.wait_for_timeout(1500)
+    goto_app_page(page, REWARD_URL_HASH)
+    page.wait_for_timeout(1500)
+    log_stage("login:post-nav", username=creds.username, url=page.url)
     if "auth/login" in page.url:
         raise SignInError("登录后仍停留在登录页")
 
 
+def build_rys_header(page: Page) -> str:
+    page.wait_for_function("() => typeof window.fea === 'string' && window.fea.length > 0", timeout=DEFAULT_TIMEOUT_MS)
+    fea = page.evaluate("() => window.fea")
+    timestamp = f"{int(time.time() * 1000) / 1000:.3f}"
+    return f"{fea}{timestamp}"
+
+
+def list_context_cookie_names(page: Page, urls: list[str] | None = None) -> list[str]:
+    cookies = page.context.cookies(urls or [LOGIN_API, TASKS_API, REWARD_URL, DASHBOARD_URL, page.url])
+    return sorted(f"{item.get('name')}@{item.get('domain')}" for item in cookies)
+
+
+def get_cookie_value(page: Page, url: str, name: str) -> str:
+    cookie = page.evaluate(
+        """
+        ({name}) => {
+          const match = document.cookie.match(new RegExp(`(?:^|; )${name}=([^;]+)`));
+          return match ? decodeURIComponent(match[1]) : '';
+        }
+        """,
+        {"name": name},
+    )
+    if cookie:
+        return cookie
+    for item in page.context.cookies([url, page.url]):
+        if item.get("name") == name:
+            return urllib.parse.unquote(item.get("value", ""))
+    return ""
+
+
 def auth_fetch(page: Page, url: str, method: str = "GET", body: dict[str, Any] | None = None) -> Any:
+    csrf = get_cookie_value(page, url, "X-CSRF-Token") or "undefined"
+    rys = build_rys_header(page)
+    log_stage("auth_fetch:start", method=method, url=url, csrf_present=csrf != "undefined", body_present=body is not None)
     return page.evaluate(
         """
-        async ({url, method, body}) => {
-          const match = document.cookie.match(/(?:^|; )X-CSRF-Token=([^;]+)/);
-          const csrf = match ? decodeURIComponent(match[1]) : '';
-          const headers = { 'x-csrf-token': csrf };
+        async ({url, method, body, csrf, rys}) => {
+          const headers = { 'x-csrf-token': csrf, 'rys': rys };
           if (body !== null) headers['content-type'] = 'application/json';
           const resp = await fetch(url, {
             method,
@@ -536,59 +631,62 @@ def auth_fetch(page: Page, url: str, method: str = "GET", body: dict[str, Any] |
           }
         }
         """,
-        {"url": url, "method": method, "body": body},
+        {"url": url, "method": method, "body": body, "csrf": csrf, "rys": rys},
     )
 
 
 def get_daily_task(page: Page) -> dict[str, Any]:
+    log_stage("task:fetch:start", url=page.url)
     tasks = auth_fetch(page, TASKS_API, "GET")
     if tasks.get("code") != 200:
+        log_stage("task:fetch:error", response=tasks)
         raise SignInError(f"读取任务列表失败: {tasks}")
     for item in tasks.get("data", []):
         if item.get("Name") == "每日签到":
+            log_stage("task:fetch:daily", status=item.get("Status"), task_id=item.get("Id"))
             return item
+    log_stage("task:fetch:missing-daily")
     raise SignInError("任务列表中没有“每日签到”")
 
 
-def trigger_daily_signin(page: Page) -> str:
-    try:
-        page.get_by_role("tab", name=re.compile(r"每日签到")).get_by_role("link", name="领取奖励").click(timeout=5_000)
-        return "dom_click"
-    except Exception:
-        open_captcha(page)
-        return "js_fallback"
+def install_tcaptcha(page: Page) -> None:
+    page.set_content('<!doctype html><html><head><meta charset="utf-8"></head><body></body></html>')
+    page.add_script_tag(url=TCAPTCHA_JS)
+    page.wait_for_function("() => typeof window.TencentCaptcha === 'function'", timeout=DEFAULT_TIMEOUT_MS)
 
 
 def open_captcha(page: Page) -> None:
     opened = page.evaluate(
-        """
-        () => {
-          if (!window.TencentCaptcha) return { ok: false, reason: 'TencentCaptcha 未加载' };
+        f"""
+        () => {{
+          if (!window.TencentCaptcha) return {{ ok: false, reason: 'TencentCaptcha 未加载' }};
           window.__rainyunCapCb = [];
           window.__rainyunCap = new window.TencentCaptcha(
-            '2039519451',
-            (res) => { window.__rainyunCapCb.push(res); },
-            {}
+            '{TCAPTCHA_APP_ID}',
+            (res) => {{ window.__rainyunCapCb.push(res); }},
+            {{}}
           );
           window.__rainyunCap.show();
-          return { ok: true };
-        }
+          return {{ ok: true }};
+        }}
         """
     )
     if not opened.get("ok"):
         raise SignInError(f"打开验证码失败: {opened}")
 
 
-def maybe_capture_prehandle(holder: dict[str, Any]):
-    def handler(resp: Response) -> None:
-        try:
-            if "cap_union_prehandle" not in resp.url:
-                return
-            holder["prehandle"] = parse_jsonp(resp.text())
-        except Exception:
-            pass
-
-    return handler
+def open_minimal_captcha(context: BrowserContext) -> tuple[Page, dict[str, Any]]:
+    page = context.new_page()
+    try:
+        install_tcaptcha(page)
+        with page.expect_response(lambda resp: "cap_union_prehandle" in resp.url, timeout=15_000) as prehandle_resp:
+            open_captcha(page)
+        frame = wait_for_captcha_frame(page)
+        prehandle = parse_jsonp(prehandle_resp.value.text())
+        return page, {"frame": frame, "prehandle": prehandle}
+    except Exception:
+        page.close()
+        raise
 
 
 def build_verify_payload(frame: Frame, sess: str, ans: list[dict[str, Any]], pow_answer: str | None, pow_calc_time: int | None) -> dict[str, Any]:
@@ -670,48 +768,84 @@ def click_points(frame: Frame, points: list[dict[str, Any]], bg_size: list[int] 
         frame.page.wait_for_timeout(250)
 
 
+def solve_captcha_with_minimal_runtime(context: BrowserContext) -> dict[str, Any]:
+    last_error: Exception | None = None
+    for attempt in range(1, CAPTCHA_VERIFY_MAX_ATTEMPTS + 1):
+        captcha_page: Page | None = None
+        log_stage("captcha:attempt:start", attempt=attempt)
+        try:
+            captcha_page, opened = open_minimal_captcha(context)
+            frame: Frame = opened["frame"]
+            prehandle: dict[str, Any] = opened["prehandle"]
+            captcha_data = prehandle["data"]
+            show_info = captcha_data["dyn_show_info"]
+            comm_cfg = captcha_data["comm_captcha_cfg"]
+            bg_size = show_info["bg_elem_cfg"]["size_2d"]
+
+            solved = solve_points_with_tenvision(frame, bg_size)
+            points = solved["points"]
+            log_stage("captcha:solver:done", attempt=attempt, mode=solved.get("mode"), points=len(points))
+            click_points(frame, points)
+            frame.page.wait_for_timeout(500)
+
+            ans = [
+                {
+                    "elem_id": index + 1,
+                    "type": "DynAnswerType_POS",
+                    "data": f"{point['x']},{point['y']}",
+                }
+                for index, point in enumerate(points)
+            ]
+
+            pow_cfg = comm_cfg.get("pow_cfg") or {}
+            pow_answer = None
+            pow_calc_time = None
+            if pow_cfg.get("prefix") and pow_cfg.get("md5"):
+                log_stage("captcha:pow:start", attempt=attempt)
+                pow_answer, pow_calc_time = solve_pow(pow_cfg["prefix"], pow_cfg["md5"])
+                log_stage("captcha:pow:done", attempt=attempt, calc_time=pow_calc_time)
+
+            verify_payload = build_verify_payload(frame, prehandle["sess"], ans, pow_answer, pow_calc_time)
+            log_stage("captcha:verify:start", attempt=attempt, payload_keys=list(verify_payload.keys()))
+            verify_result = post_verify(context, verify_payload)
+            log_stage("captcha:verify:result", attempt=attempt, errorCode=verify_result.get("errorCode"), randstr=verify_result.get("randstr"))
+            if verify_result.get("errorCode") == "0":
+                return {
+                    "attempt": attempt,
+                    "trigger": "minimal_runtime",
+                    "solver": {"mode": solved.get("mode"), "score": solved.get("score"), "points": points},
+                    "verify": {
+                        "randstr": verify_result.get("randstr"),
+                        "ticket": verify_result.get("ticket"),
+                        "payload_keys": list(verify_payload.keys()),
+                    },
+                }
+            last_error = SignInError(f"验证码校验失败: {verify_result}")
+        except Exception as exc:
+            log_stage("captcha:attempt:error", attempt=attempt, error=str(exc))
+            last_error = exc
+        finally:
+            if captcha_page:
+                captcha_page.close()
+    if last_error is None:
+        raise SignInError("验证码处理失败")
+    raise SignInError(f"最小验证码运行时连续失败 {CAPTCHA_VERIFY_MAX_ATTEMPTS} 次: {last_error}")
+
+
 def perform_signin(page: Page) -> dict[str, Any]:
+    log_stage("signin:start", url=page.url)
     daily = get_daily_task(page)
     if daily.get("Status") in (2, "2"):
+        log_stage("signin:already-done")
         return {"status": "already_done", "task": daily}
     if daily.get("Status") not in (1, "1"):
         raise SignInError(f"每日签到当前不是可领取状态: {daily}")
 
-    with page.expect_response(lambda resp: "cap_union_prehandle" in resp.url, timeout=15_000) as prehandle_resp:
-        trigger = trigger_daily_signin(page)
-    frame = wait_for_captcha_frame(page)
-    prehandle = parse_jsonp(prehandle_resp.value.text())
+    log_stage("signin:captcha:start")
+    captcha_result = solve_captcha_with_minimal_runtime(page.context)
 
-    captcha_data = prehandle["data"]
-    show_info = captcha_data["dyn_show_info"]
-    comm_cfg = captcha_data["comm_captcha_cfg"]
-    bg_size = show_info["bg_elem_cfg"]["size_2d"]
-
-    solved = solve_points_with_tenvision(frame, bg_size)
-    points = solved["points"]
-    click_points(frame, points)
-    frame.page.wait_for_timeout(500)
-
-    ans = [
-        {
-            "elem_id": index + 1,
-            "type": "DynAnswerType_POS",
-            "data": f"{point['x']},{point['y']}",
-        }
-        for index, point in enumerate(points)
-    ]
-
-    pow_cfg = comm_cfg.get("pow_cfg") or {}
-    pow_answer = None
-    pow_calc_time = None
-    if pow_cfg.get("prefix") and pow_cfg.get("md5"):
-        pow_answer, pow_calc_time = solve_pow(pow_cfg["prefix"], pow_cfg["md5"])
-
-    verify_payload = build_verify_payload(frame, prehandle["sess"], ans, pow_answer, pow_calc_time)
-    verify_result = post_verify(page.context, verify_payload)
-    if verify_result.get("errorCode") != "0":
-        raise SignInError(f"验证码校验失败: {verify_result}")
-
+    verify = captcha_result["verify"]
+    log_stage("signin:submit:start", randstr=verify["randstr"])
     sign_result = auth_fetch(
         page,
         TASKS_API,
@@ -719,23 +853,26 @@ def perform_signin(page: Page) -> dict[str, Any]:
         {
             "task_name": "每日签到",
             "verifyCode": "",
-            "vticket": verify_result["ticket"],
-            "vrandstr": verify_result["randstr"],
+            "vticket": verify["ticket"],
+            "vrandstr": verify["randstr"],
         },
     )
+    log_stage("signin:submit:result", code=sign_result.get("code"), msg=sign_result.get("msg"))
     if sign_result.get("code") != 200:
         raise SignInError(f"签到接口失败: {sign_result}")
 
-    page.goto(REWARD_URL_HASH, wait_until="load", timeout=DEFAULT_TIMEOUT_MS)
-    page.wait_for_timeout(3000)
+    goto_app_page(page, REWARD_URL_HASH)
+    page.wait_for_timeout(1500)
     after = get_daily_task(page)
+    log_stage("signin:done", after_status=after.get("Status"))
     return {
         "status": "signed",
         "task_before": daily,
         "task_after": after,
-        "trigger": trigger,
-        "solver": {"mode": solved.get("mode"), "score": solved.get("score"), "points": points},
-        "verify": {"randstr": verify_result.get("randstr")},
+        "trigger": captcha_result["trigger"],
+        "captcha_attempt": captcha_result["attempt"],
+        "solver": captcha_result["solver"],
+        "verify": {"randstr": verify["randstr"], "payload_keys": verify["payload_keys"]},
         "sign": sign_result,
     }
 
@@ -757,24 +894,106 @@ def run_sample_mode(captcha_path: Path, output_path: Path) -> int:
     return 0
 
 
-def run_signin_mode(env_path: Path, headless: bool) -> int:
+def list_account_files(env_dir: Path) -> list[Path]:
+    if not env_dir.exists():
+        raise SignInError(f"账号目录不存在: {env_dir}")
+    if not env_dir.is_dir():
+        raise SignInError(f"账号目录不是文件夹: {env_dir}")
+    files = sorted(path.resolve() for path in env_dir.iterdir() if path.is_file() and not path.name.startswith("."))
+    if not files:
+        raise SignInError(f"账号目录中没有可用账号文件: {env_dir}")
+    return files
+
+
+def run_signin_once(browser: Any, env_path: Path) -> dict[str, Any]:
     creds = read_credentials(env_path)
+    log_stage("account:start", account_file=str(env_path), username=creds.username)
+    context = browser.new_context()
+    page = context.new_page()
+    try:
+        login_via_protocol(page, creds)
+        result = perform_signin(page)
+        log_stage("account:done", username=creds.username, status=result.get("status"))
+        return {
+            "account_file": str(env_path),
+            "username": creds.username,
+            **result,
+        }
+    finally:
+        context.close()
+
+
+def run_signin_mode(env_path: Path, headless: bool) -> int:
+    log_stage("mode:single", env_path=str(env_path), headless=headless)
     with sync_playwright() as playwright:
         browser = playwright.chromium.launch(headless=headless)
-        context = browser.new_context()
-        page = context.new_page()
         try:
-            login_via_protocol(page, creds)
-            result = perform_signin(page)
+            result = run_signin_once(browser, env_path)
             print(json.dumps(result, ensure_ascii=False, indent=2))
             return 0
         finally:
             browser.close()
 
 
+def run_multi_signin_mode(env_dir: Path, headless: bool) -> int:
+    account_files = list_account_files(env_dir)
+    log_stage("mode:multi", env_dir=str(env_dir), total=len(account_files), headless=headless)
+    results: list[dict[str, Any]] = []
+    failed = 0
+    with sync_playwright() as playwright:
+        browser = playwright.chromium.launch(headless=headless)
+        try:
+            for env_path in account_files:
+                username = None
+                try:
+                    username = read_credentials(env_path).username
+                    results.append(run_signin_once(browser, env_path))
+                except PlaywrightTimeoutError as exc:
+                    failed += 1
+                    log_stage("account:error", username=username, error=str(exc))
+                    results.append(
+                        {
+                            "account_file": str(env_path),
+                            "username": username,
+                            "status": "error",
+                            "error": f"页面等待超时: {exc}",
+                        }
+                    )
+                except SignInError as exc:
+                    failed += 1
+                    log_stage("account:error", username=username, error=str(exc))
+                    results.append(
+                        {
+                            "account_file": str(env_path),
+                            "username": username,
+                            "status": "error",
+                            "error": str(exc),
+                        }
+                    )
+        finally:
+            browser.close()
+
+    print(
+        json.dumps(
+            {
+                "mode": "multi_account",
+                "total": len(account_files),
+                "success": len(account_files) - failed,
+                "failed": failed,
+                "results": results,
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+    )
+    return 1 if failed else 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Rainyun 每日签到自动化")
-    parser.add_argument("--env", default=".env", help="账号文件路径")
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument("--env", help="账号文件路径")
+    group.add_argument("--env-dir", help="账号目录路径，目录下每个文件视为一个账号")
     parser.add_argument("--headful", action="store_true", help="以有界面模式运行")
     parser.add_argument("--sample", metavar="CAPTCHA", help="离线测试完整验证码截图")
     args = parser.parse_args()
@@ -785,7 +1004,10 @@ def main() -> int:
             captcha_path = Path(args.sample).resolve()
             output_path = captcha_path.with_name(f"{captcha_path.stem}_tenvision{captcha_path.suffix or '.png'}")
             return run_sample_mode(captcha_path, output_path)
-        return run_signin_mode(Path(args.env).resolve(), headless)
+        if args.env_dir:
+            return run_multi_signin_mode(Path(args.env_dir).resolve(), headless)
+        env_path = Path(args.env).resolve() if args.env else Path(".env").resolve()
+        return run_signin_mode(env_path, headless)
     except SignInError as exc:
         print(str(exc), file=sys.stderr)
         return 1
