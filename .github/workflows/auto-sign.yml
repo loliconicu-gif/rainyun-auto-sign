@@ -2,9 +2,9 @@ name: 雨云每日自动签到
 
 on:
   schedule:
-    # 每天北京时间 09:00 运行（UTC+8，即 UTC 01:00）
+    # 每天北京时间 09:00 运行
     - cron: '0 1 * * *'
-  workflow_dispatch:  # 允许手动触发
+  workflow_dispatch: # 允许手动触发
 
 jobs:
   sign-in:
@@ -20,8 +20,11 @@ jobs:
       - name: 设置 Python 版本
         run: uv python install
 
-      - name: 安装依赖
+      - name: 安装项目依赖
         run: uv sync
+
+      - name: 安装 Playwright 浏览器
+        run: uv run playwright install chromium --with-deps
 
       - name: 创建账号配置文件
         run: |
