@@ -28,93 +28,83 @@ jobs:
       - name: 创建账号配置文件
         run: |
           mkdir -p accounts
-
           cat > accounts/account1.env << EOF
           username: ${{ secrets.RAINYUN_USERNAME_1 }}
           password: ${{ secrets.RAINYUN_PASSWORD_1 }}
           EOF
-
           cat > accounts/account2.env << EOF
           username: ${{ secrets.RAINYUN_USERNAME_2 }}
           password: ${{ secrets.RAINYUN_PASSWORD_2 }}
           EOF
-
           cat > accounts/account3.env << EOF
           username: ${{ secrets.RAINYUN_USERNAME_3 }}
           password: ${{ secrets.RAINYUN_PASSWORD_3 }}
           EOF
-
           cat > accounts/account4.env << EOF
           username: ${{ secrets.RAINYUN_USERNAME_4 }}
           password: ${{ secrets.RAINYUN_PASSWORD_4 }}
           EOF
-
           cat > accounts/account5.env << EOF
           username: ${{ secrets.RAINYUN_USERNAME_5 }}
           password: ${{ secrets.RAINYUN_PASSWORD_5 }}
           EOF
-
           cat > accounts/account6.env << EOF
           username: ${{ secrets.RAINYUN_USERNAME_6 }}
           password: ${{ secrets.RAINYUN_PASSWORD_6 }}
           EOF
-
           cat > accounts/account7.env << EOF
           username: ${{ secrets.RAINYUN_USERNAME_7 }}
           password: ${{ secrets.RAINYUN_PASSWORD_7 }}
           EOF
-
           cat > accounts/account8.env << EOF
           username: ${{ secrets.RAINYUN_USERNAME_8 }}
           password: ${{ secrets.RAINYUN_PASSWORD_8 }}
           EOF
-
           cat > accounts/account9.env << EOF
           username: ${{ secrets.RAINYUN_USERNAME_9 }}
           password: ${{ secrets.RAINYUN_PASSWORD_9 }}
           EOF
-
           cat > accounts/account10.env << EOF
           username: ${{ secrets.RAINYUN_USERNAME_10 }}
           password: ${{ secrets.RAINYUN_PASSWORD_10 }}
           EOF
 
       - name: 签到账号1
-        if: ${{ secrets.RAINYUN_USERNAME_1 != '' }}
+        continue-on-error: true
         run: uv run python rainyun_signin.py --env accounts/account1.env
 
       - name: 签到账号2
-        if: ${{ secrets.RAINYUN_USERNAME_2 != '' }}
+        continue-on-error: true
         run: uv run python rainyun_signin.py --env accounts/account2.env
 
       - name: 签到账号3
-        if: ${{ secrets.RAINYUN_USERNAME_3 != '' }}
+        continue-on-error: true
         run: uv run python rainyun_signin.py --env accounts/account3.env
 
       - name: 签到账号4
-        if: ${{ secrets.RAINYUN_USERNAME_4 != '' }}
+        continue-on-error: true
         run: uv run python rainyun_signin.py --env accounts/account4.env
 
       - name: 签到账号5
-        if: ${{ secrets.RAINYUN_USERNAME_5 != '' }}
+        continue-on-error: true
         run: uv run python rainyun_signin.py --env accounts/account5.env
 
       - name: 签到账号6
-        if: ${{ secrets.RAINYUN_USERNAME_6 != '' }}
+        continue-on-error: true
         run: uv run python rainyun_signin.py --env accounts/account6.env
 
       - name: 签到账号7
-        if: ${{ secrets.RAINYUN_USERNAME_7 != '' }}
+        continue-on-error: true
         run: uv run python rainyun_signin.py --env accounts/account7.env
 
       - name: 签到账号8
-        if: ${{ secrets.RAINYUN_USERNAME_8 != '' }}
+        continue-on-error: true
         run: uv run python rainyun_signin.py --env accounts/account8.env
 
       - name: 签到账号9
-        if: ${{ secrets.RAINYUN_USERNAME_9 != '' }}
+        continue-on-error: true
         run: uv run python rainyun_signin.py --env accounts/account9.env
 
       - name: 签到账号10
-        if: ${{ secrets.RAINYUN_USERNAME_10 != '' }}
+        continue-on-error: true
         run: uv run python rainyun_signin.py --env accounts/account10.env
